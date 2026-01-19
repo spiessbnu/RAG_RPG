@@ -1,164 +1,107 @@
-"""
-Streamlit app implementing a simple chatbot that uses OpenAI's Conversation
-and Retrieval APIs.  Each user session starts a fresh conversation state
-and performs a vector search against a pre-existing vector store to
-retrieve relevant context before answering the user's query.  The app
-leverages Streamlit's session state to persist the conversation ID and
-chat history across interactions within a single session.
-
-To use this app you will need an OpenAI API key with access to the
-Conversation and Retrieval APIs and the ID of a vector store (previously
-created via the OpenAI API).  For demonstration purposes the vector store
-ID is read from an environment variable named ``VECTOR_STORE_ID``.
-
-Usage:
-
-    streamlit run streamlit_app.py
-
-This will start a local web server where you can chat with the model.
-
-Note: this example does not perform any explicit web browsing to fetch
-additional information—it relies solely on the contents of the specified
-vector store.  It also includes a safety guard in the prompt to ask the
-model to decline answering if the retrieved context is insufficient.
-"""
-
 import os
 import streamlit as st
 from openai import OpenAI
 
+# ----------------------------
+# Config
+# ----------------------------
+MODEL = "gpt-4o-mini"
+VECTOR_STORE_ID_DEFAULT = "vs_696e5b25f30081918c3ebf06a27cf520"
 
-def init_openai_client(api_key: str) -> OpenAI:
-    """Instantiate an OpenAI client with the provided API key."""
-    return OpenAI(api_key=api_key)
+STRICT_SYSTEM = """
+Você é um assistente do cenário NYCS (RPG cyberpunk/pós-apocalíptico) operando com Retrieval.
+Regras obrigatórias:
+
+1) Use APENAS informações recuperadas via ferramenta file_search (vector store do lore NYCS) e o histórico da conversa.
+2) Se a resposta NÃO estiver sustentada pelo material recuperado, responda EXATAMENTE:
+   "Não há informação suficiente no lore indexado para responder com segurança."
+3) Não invente fatos, não especule, não complete lacunas.
+4) Se a pergunta for ambígua, faça 1 pergunta de esclarecimento (máx. 1 frase) e apresente 2 interpretações possíveis (em bullets).
+5) Mantenha a resposta objetiva e bem estruturada (títulos curtos e bullets quando ajudar).
+""".strip()
 
 
-def create_conversation(client: OpenAI) -> str:
-    """Create a new conversation via the OpenAI API and return its ID."""
-    conv = client.conversations.create()
-    return conv.id
+def get_client() -> OpenAI:
+    return OpenAI()
 
 
-def search_vector_store(client: OpenAI, vector_store_id: str, query: str, k: int = 5) -> str:
-    """
-    Search the given vector store for documents relevant to the query and
-    build a single context string by concatenating the retrieved documents.
+def ensure_conversation(client: OpenAI) -> str:
+    """Create one conversation per Streamlit session."""
+    if "conversation_id" not in st.session_state:
+        conv = client.conversations.create(
+            metadata={"app": "nycs_streamlit", "world": "NYCS"}
+        )
+        st.session_state.conversation_id = conv.id
+    return st.session_state.conversation_id
 
-    Args:
-        client: An authenticated OpenAI client.
-        vector_store_id: The ID of the vector store to search.
-        query: The user's question.
-        k: How many top results to retrieve.
 
-    Returns:
-        A string containing the concatenated documents.
-    """
-    search_results = client.vector_stores.search(
-        vector_store_id=vector_store_id,
-        query=query,
-        k=k,
+def call_nycs_assistant(client: OpenAI, conversation_id: str, vector_store_id: str, user_text: str) -> str:
+    resp = client.responses.create(
+        model=MODEL,
+        conversation=conversation_id,
+        input=[
+            {"role": "system", "content": STRICT_SYSTEM},
+            {"role": "user", "content": user_text},
+        ],
+        tools=[{
+            "type": "file_search",
+            "vector_store_ids": [vector_store_id],
+            # opcional (dependendo da versão do SDK):
+            # "max_num_results": 8,
+        }],
     )
-    # The response contains a .data attribute which is a list of matches.
-    # Each match has a `.document` field with the original document text.
-    context_parts = []
-    for match in search_results.data:
-        # Only include non-empty documents to avoid unnecessary whitespace.
-        doc_text = match.document.strip()
-        if doc_text:
-            context_parts.append(doc_text)
-    return "\n\n".join(context_parts)
-
-
-def build_prompt(context: str, question: str) -> str:
-    """
-    Build a prompt for the responses API that clearly separates the
-    retrieved context from the user's question and instructs the model
-    not to answer beyond the provided context.
-
-    Args:
-        context: A string of retrieved documents from the vector store.
-        question: The user's question.
-
-    Returns:
-        A formatted string suitable for passing to the responses API.
-    """
-    instructions = (
-        "Você é um assistente que responde apenas com base no contexto fornecido."
-        " Se o contexto não contiver informações relevantes para a pergunta,"
-        " responda que não sabe ou que não pode ajudar. Não invente fatos."
-    )
-    prompt = f"Instruções: {instructions}\n\nContexto:\n{context}\n\nPergunta: {question}\n\nResposta:"
-    return prompt
+    return resp.output_text
 
 
 def main():
-    st.set_page_config(page_title="Chatbot com Retrieval e Conversa", layout="centered")
-    st.title("Chatbot com Retrieval e Conversation API")
+    st.set_page_config(page_title="NYCS RAG Chat", page_icon="🗽")
+    st.title("🗽 NYCS RAG Chat (OpenAI Responses + Conversation State)")
 
-    # Collect the OpenAI API key from the user if not provided via environment
-    default_key = os.environ.get("OPENAI_API_KEY", "")
-    api_key = st.sidebar.text_input("Chave da API OpenAI", value=default_key, type="password")
-    if not api_key:
-        st.info("Insira sua chave de API na barra lateral para começar.")
+    # Sidebar config
+    with st.sidebar:
+        st.header("Configuração")
+        vector_store_id = st.text_input("Vector Store ID", value=VECTOR_STORE_ID_DEFAULT)
+        st.caption("Cada sessão do Streamlit = uma conversa nova (conversation state).")
+
+        if st.button("🔄 Nova conversa"):
+            # reset conversation + chat UI
+            for key in ["conversation_id", "messages"]:
+                if key in st.session_state:
+                    del st.session_state[key]
+            st.rerun()
+
+    if not os.getenv("OPENAI_API_KEY"):
+        st.error("OPENAI_API_KEY não está definido no ambiente.")
         st.stop()
 
-    # Collect the vector store ID from environment or the user.
-    default_vs = os.environ.get("VECTOR_STORE_ID", "")
-    vector_store_id = st.sidebar.text_input("ID do Vector Store", value=default_vs)
-    if not vector_store_id:
-        st.info("Insira o ID do vector store na barra lateral.")
-        st.stop()
+    client = get_client()
+    conversation_id = ensure_conversation(client)
 
-    # Initialise the client and conversation on first run.
-    if "client" not in st.session_state:
-        st.session_state.client = init_openai_client(api_key)
+    # UI message history (local, só para exibição)
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
 
-    if "conversation_id" not in st.session_state:
-        # Start a new conversation for this session.
-        st.session_state.conversation_id = create_conversation(st.session_state.client)
-        st.session_state.chat_history = []
+    for m in st.session_state.messages:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
 
-    # Display previous chat messages.
-    for entry in st.session_state.chat_history:
-        role = entry["role"]
-        content = entry["content"]
-        if role == "user":
-            st.chat_message("Usuário").markdown(content)
-        else:
-            st.chat_message("Assistente").markdown(content)
+    user_msg = st.chat_input("Pergunte algo sobre NYCS...")
+    if user_msg:
+        st.session_state.messages.append({"role": "user", "content": user_msg})
+        with st.chat_message("user"):
+            st.markdown(user_msg)
 
-    # User input box for the next question.
-    question = st.chat_input("Faça sua pergunta aqui...")
-    if question:
-        # Append user message to history and display it.
-        st.session_state.chat_history.append({"role": "user", "content": question})
-        st.chat_message("Usuário").markdown(question)
+        with st.chat_message("assistant"):
+            with st.spinner("Consultando lore indexado..."):
+                answer = call_nycs_assistant(
+                    client=client,
+                    conversation_id=conversation_id,
+                    vector_store_id=vector_store_id,
+                    user_text=user_msg,
+                )
+            st.markdown(answer)
 
-        # Retrieve context from the vector store.
-        context = search_vector_store(
-            client=st.session_state.client,
-            vector_store_id=vector_store_id,
-            query=question,
-            k=5,
-        )
-
-        # Build the prompt with safety instructions.
-        prompt = build_prompt(context=context, question=question)
-
-        # Call the responses API passing the existing conversation_id.
-        try:
-            response = st.session_state.client.responses.create(
-                model="gpt-4o-mini",
-                conversation_id=st.session_state.conversation_id,
-                input=prompt,
-            )
-            answer = response.output_text.strip()
-        except Exception as e:
-            answer = f"Erro ao chamar a API: {e}"
-
-        # Append assistant response to history and display it.
-        st.session_state.chat_history.append({"role": "assistant", "content": answer})
-        st.chat_message("Assistente").markdown(answer)
+        st.session_state.messages.append({"role": "assistant", "content": answer})
 
 
 if __name__ == "__main__":
